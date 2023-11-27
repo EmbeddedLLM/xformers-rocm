@@ -210,109 +210,123 @@ def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
     ]
 
 
-def validate_and_update_archs(archs):
-    # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
+# def validate_and_update_archs(archs):
+#     # List of allowed architectures
+#     allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
 
-    # Validate if each element in archs is in allowed_archs
-    assert all(
-        arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+#     # Validate if each element in archs is in allowed_archs
+#     assert all(
+#         arch in allowed_archs for arch in archs
+#     ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
 
-def rename_cpp_to_hip(cpp_files):
-    for entry in cpp_files:
-        shutil.copy(entry, os.path.splitext(entry)[0] + ".hip")
+# def rename_cpp_to_hip(cpp_files):
+#     for entry in cpp_files:
+#         shutil.copy(entry, os.path.splitext(entry)[0] + ".hip")
 
-def get_flash_attention_rocm_extensions(cuda_version: int, extra_compile_args):
-    # XXX: Not supported on windows for cuda<12
-    # https://github.com/Dao-AILab/flash-attention/issues/345rm"""
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
-    validate_and_update_archs(archs)
-    cc_flag = [f"--offload-arch={arch}" for arch in archs]
+# def get_flash_attention_rocm_extensions(cuda_version: int, extra_compile_args):
+#     # XXX: Not supported on windows for cuda<12
+#     # https://github.com/Dao-AILab/flash-attention/issues/345rm
+#     archs = os.getenv("GPU_ARCHS", "native").split(";")
+#     validate_and_update_archs(archs)
+#     cc_flag = [f"--offload-arch={arch}" for arch in archs]
 
-    if int(os.environ.get("FLASH_ATTENTION_INTERNAL_USE_RTN", 0)):
-        print("RTN IS USED")
-        cc_flag.append("-DUSE_RTN_BF16_CONVERT")
-    else:
-        print("RTZ IS USED")
+#     if int(os.environ.get("FLASH_ATTENTION_INTERNAL_USE_RTN", 0)):
+#         print("RTN IS USED")
+#         cc_flag.append("-DUSE_RTN_BF16_CONVERT")
+#     else:
+#         print("RTZ IS USED")
 
-    flash_root = os.path.join(this_dir, "third_party", "flash-attention-rocm")
-    if not os.path.exists(flash_root):
-        raise RuntimeError(
-            "flashattention submodule not found. Did you forget "
-            "to run `git submodule update --init --recursive` ?"
-        )
+#     flash_root = os.path.join(this_dir, "third_party", "flash-attention-rocm")
+#     if not os.path.exists(flash_root):
+#         raise RuntimeError(
+#             "flashattention submodule not found. Did you forget "
+#             "to run `git submodule update --init --recursive` ?"
+#         )
 
 
-    fa_sources = [f"{flash_root}/csrc/flash_attn_rocm/flash_api.cpp"] + glob.glob(
-        f"{flash_root}/csrc/flash_attn_rocm/src/*.cpp"
-    )
+#     fa_sources = [f"{flash_root}/csrc/flash_attn_rocm/flash_api.cpp"] + glob.glob(
+#         f"{flash_root}/csrc/flash_attn_rocm/src/*.cpp"
+#     )
 
-    rename_cpp_to_hip(fa_sources)
-    subprocess.run(
-        [
-            "PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')",
-            "&&",
-            "patch",
-            "\"${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py\"",
-            f"{flash_root}/hipify_patch.patch",
-        ],
-        check=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "submodule",
-            "update",
-            "--init",
-            f"{flash_root}/csrc/flash_attn_rocm/composable_kernel",
-        ],
-        check=True,
-    )
+#     rename_cpp_to_hip(fa_sources)
 
-    subprocess.run(
-        [
-            "git",
-            "submodule",
-            "update",
-            "--init",
-            f"{flash_root}/csrc/flash_attn_rocm/composable_kernel",
-        ],
-        check=True,
-    )
-    return [
-        CUDAExtension(
-            name="xformers._C_flashattention",
-            sources=fa_sources,
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++20", "-DNDEBUG"] + generator_flag,
-                "nvcc": [
-                    "-O3",
-                    "-std=c++20",
-                    "-DNDEBUG",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                ]
-                + generator_flag
-                + cc_flag,
-            },
-            include_dirs=[
-                Path(this_dir) / "csrc" / "flash_attn_rocm",
-                Path(this_dir) / "csrc" / "flash_attn_rocm" / "src",
-                Path(this_dir)
-                / "csrc"
-                / "flash_attn_rocm"
-                / "composable_kernel"
-                / "include",
-                Path(this_dir)
-                / "csrc"
-                / "flash_attn_rocm"
-                / "composable_kernel"
-                / "library"
-                / "include",
-            ],
-        )
-    ]
+#     # Get the site-packages directory using Python
+#     python_site_packages = subprocess.check_output(
+#         [sys.executable, '-c', 'import site; print(site.getsitepackages()[0])'],
+#         universal_newlines=True,
+#         check=True,
+#     ).strip()
+
+#     print("python_site_packages: ", python_site_packages)
+
+#     # Set the environment variable
+#     os.environ['PYTHON_SITE_PACKAGES'] = python_site_packages
+
+#     # Construct the path to the file to be patched
+#     hipify_python_path = os.path.join(python_site_packages, 'torch/utils/hipify/hipify_python.py')
+
+#     # Apply the patch
+#     subprocess.run(['patch', hipify_python_path, f'{flash_root}/hipify_patch.patch'],
+#         check=True,
+#     )
+
+
+#     # subprocess.run([
+#     #     "export",
+#     #     "PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')"
+#     # ])
+#     # subprocess.run(
+#     #     [
+#     #         "patch",
+#     #         "${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py",
+#     #         f"{flash_root}/hipify_patch.patch",
+#     #     ],
+#     #     check=True,
+#     # )
+
+#     subprocess.run(
+#         [
+#             "git",
+#             "submodule",
+#             "update",
+#             "--init",
+#             f"{flash_root}/csrc/flash_attn_rocm/composable_kernel",
+#         ],
+#         check=True,
+#     )
+#     return [
+#         CUDAExtension(
+#             name="xformers._C_flashattention",
+#             sources=fa_sources,
+#             extra_compile_args={
+#                 "cxx": ["-O3", "-std=c++20", "-DNDEBUG"] + generator_flag,
+#                 "nvcc": [
+#                     "-O3",
+#                     "-std=c++20",
+#                     "-DNDEBUG",
+#                     "-U__CUDA_NO_HALF_OPERATORS__",
+#                     "-U__CUDA_NO_HALF_CONVERSIONS__",
+#                 ]
+#                 + generator_flag
+#                 + cc_flag,
+#             },
+#             include_dirs=[
+#                 Path(this_dir) / "csrc" / "flash_attn_rocm",
+#                 Path(this_dir) / "csrc" / "flash_attn_rocm" / "src",
+#                 Path(this_dir)
+#                 / "csrc"
+#                 / "flash_attn_rocm"
+#                 / "composable_kernel"
+#                 / "include",
+#                 Path(this_dir)
+#                 / "csrc"
+#                 / "flash_attn_rocm"
+#                 / "composable_kernel"
+#                 / "library"
+#                 / "include",
+#             ],
+#         )
+#     ]
 
 def get_extensions():
 
@@ -429,59 +443,60 @@ def get_extensions():
             },
         }
     elif torch.cuda.is_available() and torch.version.hip: 
+        return None, None
 
-        extensions_dir = os.path.join("xformers", "csrc")
-        sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
-        source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
-        extension = CppExtension
+    #     extensions_dir = os.path.join("xformers", "csrc")
+    #     sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
+    #     source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
+    #     extension = CppExtension
 
-        define_macros = []
+    #     define_macros = []
 
-        extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
+    #     extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
 
-        include_dirs = [extensions_dir]
-        ext_modules = []
-        cuda_version = None
-        flash_version = "0.0.0"
+    #     include_dirs = [extensions_dir]
+    #     ext_modules = []
+    #     cuda_version = None
+    #     flash_version = "0.0.0"
 
-        extension = CUDAExtension
-        sources += source_cuda
+    #     extension = CUDAExtension
+    #     sources += source_cuda
 
-        flash_extensions = get_flash_attention_rocm_extensions(
-            cuda_version=cuda_version, extra_compile_args=extra_compile_args
-        )
-        if flash_extensions:
-            flash_version = get_flash_version()
-        ext_modules += flash_extensions
+    #     flash_extensions = get_flash_attention_rocm_extensions(
+    #         cuda_version=cuda_version, extra_compile_args=extra_compile_args
+    #     )
+    #     if flash_extensions:
+    #         flash_version = get_flash_version()
+    #     ext_modules += flash_extensions
 
-        ext_modules.append(
-            extension(
-                "xformers._C",
-                sorted(sources),
-                include_dirs=[os.path.abspath(p) for p in include_dirs],
-                define_macros=define_macros,
-                extra_compile_args=extra_compile_args,
-            )
-        )
+    #     ext_modules.append(
+    #         extension(
+    #             "xformers._C",
+    #             sorted(sources),
+    #             include_dirs=[os.path.abspath(p) for p in include_dirs],
+    #             define_macros=define_macros,
+    #             extra_compile_args=extra_compile_args,
+    #         )
+    #     )
 
-        return ext_modules, {
-            "version": {
-                "rocm": torch.version.hip,
-                "torch": torch.__version__,
-                "python": platform.python_version(),
-                "flash": flash_version,
-            },
-            "env": {
-                k: os.environ.get(k)
-                for k in [
-                    "TORCH_CUDA_ARCH_LIST",
-                    "XFORMERS_BUILD_TYPE",
-                    "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
-                    "NVCC_FLAGS",
-                    "XFORMERS_PACKAGE_FROM",
-                ]
-            },
-        }
+    #     return ext_modules, {
+    #         "version": {
+    #             "rocm": torch.version.hip,
+    #             "torch": torch.__version__,
+    #             "python": platform.python_version(),
+    #             "flash": flash_version,
+    #         },
+    #         "env": {
+    #             k: os.environ.get(k)
+    #             for k in [
+    #                 "TORCH_CUDA_ARCH_LIST",
+    #                 "XFORMERS_BUILD_TYPE",
+    #                 "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
+    #                 "NVCC_FLAGS",
+    #                 "XFORMERS_PACKAGE_FROM",
+    #             ]
+    #         },
+    #     }
 
 
 class clean(distutils.command.clean.clean):  # type: ignore
@@ -575,14 +590,14 @@ if __name__ == "__main__":
     # parameter in `setuptools.setup`, but this does not work when
     # developing in editable mode
     # See: https://github.com/pypa/pip/issues/3160 (closed, but not fixed)
-    if torch.cuda.is_available() and torch.version.hip:
-        symlink_package(
-            "xformers._flash_attn",
-            Path("third_party") / "flash-attention-rocm" / "flash_attn",
-            is_building_wheel,
-        )
+    # if torch.cuda.is_available() and torch.version.hip:
+        # symlink_package(
+        #     "xformers._flash_attn",
+        #     Path("third_party") / "flash-attention-rocm" / "flash_attn",
+        #     is_building_wheel,
+        # )
     
-    elif torch.cuda.is_available() and torch.version.cuda:
+    if torch.cuda.is_available() and torch.version.cuda:
         symlink_package(
             "xformers._flash_attn",
             Path("third_party") / "flash-attention" / "flash_attn",
@@ -597,13 +612,13 @@ if __name__ == "__main__":
         version=version,
         install_requires=fetch_requirements(),
         packages=setuptools.find_packages(exclude=("tests*", "benchmarks*")),
-        ext_modules=extensions,
+        ext_modules=extensions if (torch.cuda.is_available() and torch.version.cuda) else None,
         cmdclass={
             "build_ext": BuildExtensionWithMetadata.with_options(
                 no_python_abi_suffix=True, xformers_build_metadata=extensions_metadata
             ),
             "clean": clean,
-        },
+        } if (torch.cuda.is_available() and torch.version.cuda) else None,
         url="https://facebookresearch.github.io/xformers/",
         python_requires=">=3.7",
         author="Facebook AI Research",
