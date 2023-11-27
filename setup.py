@@ -56,7 +56,12 @@ def get_local_version_suffix() -> str:
 
 
 def get_flash_version() -> str:
-    flash_dir = Path(__file__).parent / "third_party" / "flash-attention"
+    if torch.cuda.is_available() and torch.version.cuda: 
+        flash_dir = Path(__file__).parent / "third_party" / "flash-attention"
+    elif torch.cuda.is_available() and torch.version.hip: 
+        flash_dir = Path(__file__).parent / "third_party" / "flash-attention-rocm"
+    else:
+        raise RuntimeError("No GPU Found.")
     try:
         return subprocess.check_output(
             ["git", "describe", "--tags", "--always"],
@@ -205,118 +210,278 @@ def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
     ]
 
 
-def get_extensions():
-    extensions_dir = os.path.join("xformers", "csrc")
+def validate_and_update_archs(archs):
+    # List of allowed architectures
+    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
 
-    sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
-    source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
+    # Validate if each element in archs is in allowed_archs
+    assert all(
+        arch in allowed_archs for arch in archs
+    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
 
-    sputnik_dir = os.path.join(this_dir, "third_party", "sputnik")
-    cutlass_dir = os.path.join(this_dir, "third_party", "cutlass", "include")
-    cutlass_examples_dir = os.path.join(this_dir, "third_party", "cutlass", "examples")
-    if not os.path.exists(cutlass_dir):
+def rename_cpp_to_hip(cpp_files):
+    for entry in cpp_files:
+        shutil.copy(entry, os.path.splitext(entry)[0] + ".hip")
+
+def get_flash_attention_rocm_extensions(cuda_version: int, extra_compile_args):
+    # XXX: Not supported on windows for cuda<12
+    # https://github.com/Dao-AILab/flash-attention/issues/345rm"""
+    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    validate_and_update_archs(archs)
+    cc_flag = [f"--offload-arch={arch}" for arch in archs]
+
+    if int(os.environ.get("FLASH_ATTENTION_INTERNAL_USE_RTN", 0)):
+        print("RTN IS USED")
+        cc_flag.append("-DUSE_RTN_BF16_CONVERT")
+    else:
+        print("RTZ IS USED")
+
+    flash_root = os.path.join(this_dir, "third_party", "flash-attention-rocm")
+    if not os.path.exists(flash_root):
         raise RuntimeError(
-            f"CUTLASS submodule not found at {cutlass_dir}. "
-            "Did you forget to run "
-            "`git submodule update --init --recursive` ?"
+            "flashattention submodule not found. Did you forget "
+            "to run `git submodule update --init --recursive` ?"
         )
 
-    extension = CppExtension
 
-    define_macros = []
+    fa_sources = [f"{flash_root}/csrc/flash_attn_rocm/flash_api.cpp"] + glob.glob(
+        f"{flash_root}/csrc/flash_attn_rocm/src/*.cpp"
+    )
 
-    extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
-    if sys.platform == "win32":
-        define_macros += [("xformers_EXPORTS", None)]
-        extra_compile_args["cxx"].extend(["/MP", "/Zc:lambda", "/Zc:preprocessor"])
-    elif "OpenMP not found" not in torch.__config__.parallel_info():
-        extra_compile_args["cxx"].append("-fopenmp")
+    rename_cpp_to_hip(fa_sources)
+    subprocess.run(
+        [
+            "PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')",
+            "&&",
+            "patch",
+            "\"${PYTHON_SITE_PACKAGES}/torch/utils/hipify/hipify_python.py\"",
+            f"{flash_root}/hipify_patch.patch",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "submodule",
+            "update",
+            "--init",
+            f"{flash_root}/csrc/flash_attn_rocm/composable_kernel",
+        ],
+        check=True,
+    )
 
-    include_dirs = [extensions_dir]
-    ext_modules = []
-    cuda_version = None
-    flash_version = "0.0.0"
+    subprocess.run(
+        [
+            "git",
+            "submodule",
+            "update",
+            "--init",
+            f"{flash_root}/csrc/flash_attn_rocm/composable_kernel",
+        ],
+        check=True,
+    )
+    return [
+        CUDAExtension(
+            name="xformers._C_flashattention",
+            sources=fa_sources,
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20", "-DNDEBUG"] + generator_flag,
+                "nvcc": [
+                    "-O3",
+                    "-std=c++20",
+                    "-DNDEBUG",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                ]
+                + generator_flag
+                + cc_flag,
+            },
+            include_dirs=[
+                Path(this_dir) / "csrc" / "flash_attn_rocm",
+                Path(this_dir) / "csrc" / "flash_attn_rocm" / "src",
+                Path(this_dir)
+                / "csrc"
+                / "flash_attn_rocm"
+                / "composable_kernel"
+                / "include",
+                Path(this_dir)
+                / "csrc"
+                / "flash_attn_rocm"
+                / "composable_kernel"
+                / "library"
+                / "include",
+            ],
+        )
+    ]
 
-    if (
-        (torch.cuda.is_available() and ((CUDA_HOME is not None)))
-        or os.getenv("FORCE_CUDA", "0") == "1"
-        or os.getenv("TORCH_CUDA_ARCH_LIST", "") != ""
-    ):
+def get_extensions():
+
+    if torch.cuda.is_available() and torch.version.cuda: 
+        extensions_dir = os.path.join("xformers", "csrc")
+
+        sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
+        source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
+
+        sputnik_dir = os.path.join(this_dir, "third_party", "sputnik")
+        cutlass_dir = os.path.join(this_dir, "third_party", "cutlass", "include")
+        cutlass_examples_dir = os.path.join(this_dir, "third_party", "cutlass", "examples")
+        if not os.path.exists(cutlass_dir):
+            raise RuntimeError(
+                f"CUTLASS submodule not found at {cutlass_dir}. "
+                "Did you forget to run "
+                "`git submodule update --init --recursive` ?"
+            )
+
+        extension = CppExtension
+
+        define_macros = []
+
+        extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
+        if sys.platform == "win32":
+            define_macros += [("xformers_EXPORTS", None)]
+            extra_compile_args["cxx"].extend(["/MP", "/Zc:lambda", "/Zc:preprocessor"])
+        elif "OpenMP not found" not in torch.__config__.parallel_info():
+            extra_compile_args["cxx"].append("-fopenmp")
+
+        include_dirs = [extensions_dir]
+        ext_modules = []
+        cuda_version = None
+        flash_version = "0.0.0"
+
+        if (
+            (torch.cuda.is_available() and ((CUDA_HOME is not None)))
+            or os.getenv("FORCE_CUDA", "0") == "1"
+            or os.getenv("TORCH_CUDA_ARCH_LIST", "") != ""
+        ):
+            extension = CUDAExtension
+            sources += source_cuda
+            include_dirs += [sputnik_dir, cutlass_dir, cutlass_examples_dir]
+            nvcc_flags = [
+                "-DHAS_PYTORCH",
+                "--use_fast_math",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "--extended-lambda",
+                "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
+                "-std=c++17",
+            ] + get_extra_nvcc_flags_for_build_type()
+            if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
+                nvcc_flags.append("-DNDEBUG")
+            nvcc_flags += shlex.split(os.getenv("NVCC_FLAGS", ""))
+            cuda_version = get_cuda_version(CUDA_HOME)
+            if cuda_version >= 1102:
+                nvcc_flags += [
+                    "--threads",
+                    "4",
+                    "--ptxas-options=-v",
+                ]
+            if sys.platform == "win32":
+                nvcc_flags += [
+                    "-Xcompiler",
+                    "/Zc:lambda",
+                    "-Xcompiler",
+                    "/Zc:preprocessor",
+                ]
+            extra_compile_args["nvcc"] = nvcc_flags
+
+            flash_extensions = get_flash_attention_extensions(
+                cuda_version=cuda_version, extra_compile_args=extra_compile_args
+            )
+            if flash_extensions:
+                flash_version = get_flash_version()
+            ext_modules += flash_extensions
+
+            # NOTE: This should not be applied to Flash-Attention
+            # see https://github.com/Dao-AILab/flash-attention/issues/359
+            extra_compile_args["nvcc"] += [
+                # Workaround for a regression with nvcc > 11.6
+                # See https://github.com/facebookresearch/xformers/issues/712
+                "--ptxas-options=-O2",
+                "--ptxas-options=-allow-expensive-optimizations=true",
+            ]
+
+        ext_modules.append(
+            extension(
+                "xformers._C",
+                sorted(sources),
+                include_dirs=[os.path.abspath(p) for p in include_dirs],
+                define_macros=define_macros,
+                extra_compile_args=extra_compile_args,
+            )
+        )
+
+        return ext_modules, {
+            "version": {
+                "cuda": cuda_version,
+                "torch": torch.__version__,
+                "python": platform.python_version(),
+                "flash": flash_version,
+            },
+            "env": {
+                k: os.environ.get(k)
+                for k in [
+                    "TORCH_CUDA_ARCH_LIST",
+                    "XFORMERS_BUILD_TYPE",
+                    "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
+                    "NVCC_FLAGS",
+                    "XFORMERS_PACKAGE_FROM",
+                ]
+            },
+        }
+    elif torch.cuda.is_available() and torch.version.hip: 
+
+        extensions_dir = os.path.join("xformers", "csrc")
+        sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
+        source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
+        extension = CppExtension
+
+        define_macros = []
+
+        extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
+
+        include_dirs = [extensions_dir]
+        ext_modules = []
+        cuda_version = None
+        flash_version = "0.0.0"
+
         extension = CUDAExtension
         sources += source_cuda
-        include_dirs += [sputnik_dir, cutlass_dir, cutlass_examples_dir]
-        nvcc_flags = [
-            "-DHAS_PYTORCH",
-            "--use_fast_math",
-            "-U__CUDA_NO_HALF_OPERATORS__",
-            "-U__CUDA_NO_HALF_CONVERSIONS__",
-            "--extended-lambda",
-            "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
-            "-std=c++17",
-        ] + get_extra_nvcc_flags_for_build_type()
-        if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
-            nvcc_flags.append("-DNDEBUG")
-        nvcc_flags += shlex.split(os.getenv("NVCC_FLAGS", ""))
-        cuda_version = get_cuda_version(CUDA_HOME)
-        if cuda_version >= 1102:
-            nvcc_flags += [
-                "--threads",
-                "4",
-                "--ptxas-options=-v",
-            ]
-        if sys.platform == "win32":
-            nvcc_flags += [
-                "-Xcompiler",
-                "/Zc:lambda",
-                "-Xcompiler",
-                "/Zc:preprocessor",
-            ]
-        extra_compile_args["nvcc"] = nvcc_flags
 
-        flash_extensions = get_flash_attention_extensions(
+        flash_extensions = get_flash_attention_rocm_extensions(
             cuda_version=cuda_version, extra_compile_args=extra_compile_args
         )
         if flash_extensions:
             flash_version = get_flash_version()
         ext_modules += flash_extensions
 
-        # NOTE: This should not be applied to Flash-Attention
-        # see https://github.com/Dao-AILab/flash-attention/issues/359
-        extra_compile_args["nvcc"] += [
-            # Workaround for a regression with nvcc > 11.6
-            # See https://github.com/facebookresearch/xformers/issues/712
-            "--ptxas-options=-O2",
-            "--ptxas-options=-allow-expensive-optimizations=true",
-        ]
-
-    ext_modules.append(
-        extension(
-            "xformers._C",
-            sorted(sources),
-            include_dirs=[os.path.abspath(p) for p in include_dirs],
-            define_macros=define_macros,
-            extra_compile_args=extra_compile_args,
+        ext_modules.append(
+            extension(
+                "xformers._C",
+                sorted(sources),
+                include_dirs=[os.path.abspath(p) for p in include_dirs],
+                define_macros=define_macros,
+                extra_compile_args=extra_compile_args,
+            )
         )
-    )
 
-    return ext_modules, {
-        "version": {
-            "cuda": cuda_version,
-            "torch": torch.__version__,
-            "python": platform.python_version(),
-            "flash": flash_version,
-        },
-        "env": {
-            k: os.environ.get(k)
-            for k in [
-                "TORCH_CUDA_ARCH_LIST",
-                "XFORMERS_BUILD_TYPE",
-                "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
-                "NVCC_FLAGS",
-                "XFORMERS_PACKAGE_FROM",
-            ]
-        },
-    }
+        return ext_modules, {
+            "version": {
+                "rocm": torch.version.hip,
+                "torch": torch.__version__,
+                "python": platform.python_version(),
+                "flash": flash_version,
+            },
+            "env": {
+                k: os.environ.get(k)
+                for k in [
+                    "TORCH_CUDA_ARCH_LIST",
+                    "XFORMERS_BUILD_TYPE",
+                    "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
+                    "NVCC_FLAGS",
+                    "XFORMERS_PACKAGE_FROM",
+                ]
+            },
+        }
 
 
 class clean(distutils.command.clean.clean):  # type: ignore
@@ -410,11 +575,21 @@ if __name__ == "__main__":
     # parameter in `setuptools.setup`, but this does not work when
     # developing in editable mode
     # See: https://github.com/pypa/pip/issues/3160 (closed, but not fixed)
-    symlink_package(
-        "xformers._flash_attn",
-        Path("third_party") / "flash-attention" / "flash_attn",
-        is_building_wheel,
-    )
+    if torch.cuda.is_available() and torch.version.hip:
+        symlink_package(
+            "xformers._flash_attn",
+            Path("third_party") / "flash-attention-rocm" / "flash_attn",
+            is_building_wheel,
+        )
+    
+    elif torch.cuda.is_available() and torch.version.cuda:
+        symlink_package(
+            "xformers._flash_attn",
+            Path("third_party") / "flash-attention" / "flash_attn",
+            is_building_wheel,
+        )
+
+
     extensions, extensions_metadata = get_extensions()
     setuptools.setup(
         name="xformers",
