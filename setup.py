@@ -60,8 +60,8 @@ def get_flash_version() -> str:
         flash_dir = Path(__file__).parent / "third_party" / "flash-attention"
     elif torch.cuda.is_available() and torch.version.hip: 
         flash_dir = Path(__file__).parent / "third_party" / "flash-attention-rocm"
-    else:
-        raise RuntimeError("No GPU Found.")
+    # else:
+    #     raise RuntimeError("No GPU Found.")
     try:
         return subprocess.check_output(
             ["git", "describe", "--tags", "--always"],
@@ -442,8 +442,33 @@ def get_extensions():
                 ]
             },
         }
-    elif torch.cuda.is_available() and torch.version.hip: 
-        return None, None
+    elif torch.cuda.is_available() and torch.version.hip:
+        try:
+            flash_version = get_flash_version()
+        except Exception as e:
+            flash_dir = Path(__file__).parent / "third_party" / "flash-attention-rocm"
+            raise RuntimeError(
+                f"Flash Attention submodule not found at {flash_dir}. "
+                "Did you forget to run "
+                "`git submodule update --init --recursive` ?"
+            )
+        return None, {
+            "version": {
+                "hip": torch.version.hip,
+                "torch": torch.__version__,
+                "python": platform.python_version(),
+                "flash": flash_version,
+            },
+            "env": {
+                k: os.environ.get(k)
+                for k in [
+                    "TORCH_CUDA_ARCH_LIST",
+                    "XFORMERS_BUILD_TYPE",
+                    "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
+                    "XFORMERS_PACKAGE_FROM",
+                ]
+            },
+        }
 
     #     extensions_dir = os.path.join("xformers", "csrc")
     #     sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
@@ -618,7 +643,7 @@ if __name__ == "__main__":
                 no_python_abi_suffix=True, xformers_build_metadata=extensions_metadata
             ),
             "clean": clean,
-        } if (torch.cuda.is_available() and torch.version.cuda) else None,
+        },
         url="https://facebookresearch.github.io/xformers/",
         python_requires=">=3.7",
         author="Facebook AI Research",
